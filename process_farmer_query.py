@@ -73,6 +73,13 @@ gemini_model = (
     genai.GenerativeModel(GEMINI_MODEL_NAME) if GEMINI_API_KEY_VALID else None
 )
 
+COLLECTOR_MODEL = (
+    genai.GenerativeModel(GEMINI_MODEL_NAME)
+    if GEMINI_API_KEY_VALID
+    else None
+)
+
+
 def _rule_based_intent(query: str) -> Literal["scheme", "crop", "both", "none"] | None:
     """
     Simple keyword-based classifier used when Gemini is unavailable.
@@ -291,51 +298,84 @@ async def crop_node(state):
     return {**state, "crop_response": crop_response}
 
 
-
 def error_node(state):
     return {**state, "service_response": {"error": "cannot classify"}}
 
+#function to combine instead of concatinate
+def synthesize_final_response(scheme: dict | None, crop: dict | None) -> str:
+    """
+    Uses LLM to combine scheme + crop responses into a single farmer-friendly answer.
+    Falls back to deterministic concatenation if LLM is unavailable.
+    """
+
+    scheme_text = scheme.get("response") if isinstance(scheme, dict) else None
+    crop_text = crop.get("response") if isinstance(crop, dict) else None
+
+    # ---------- Fallback (NO LLM) ----------
+    if not COLLECTOR_MODEL:
+        parts = []
+        if crop_text:
+            parts.append(f"Crop Advisory:\n{crop_text}")
+        if scheme_text:
+            parts.append(f"Government Schemes:\n{scheme_text}")
+        return "\n\n".join(parts) if parts else "No information available."
+
+    # ---------- LLM Synthesis ----------
+    prompt = f"""
+You are an agricultural assistant responding to a farmer.
+
+Combine the following information into ONE clear, helpful response.
+Use simple language suitable for farmers.
+
+Rules:
+- Do NOT repeat information.
+- Clearly separate advice vs government support.
+- If one section is missing, answer with what is available.
+- Do NOT mention sources, PDFs, or internal documents.
+
+Crop Advisory (may be empty):
+{crop_text or "N/A"}
+
+Government Schemes (may be empty):
+{scheme_text or "N/A"}
+
+Final Answer:
+"""
+
+    try:
+        response = COLLECTOR_MODEL.generate_content(prompt)
+        final_text = (response.text or "").strip()
+        return final_text or "Unable to generate final response."
+    except Exception as e:
+        # Hard fallback
+        parts = []
+        if crop_text:
+            parts.append(crop_text)
+        if scheme_text:
+            parts.append(scheme_text)
+        return "\n\n".join(parts) if parts else "No information available."
+
 def collector_node(state):
-    """Collect and combine responses from scheme and/or crop nodes"""
-    print("in collector node")
+    """
+    Combines scheme and crop responses into a single final answer using LLM.
+    """
     intent = state.get("intent")
     scheme_response = state.get("scheme_response")
     crop_response = state.get("crop_response")
-    
-    if intent in ("crop", "both") and crop_response:
-        crop_response = sanitize_crop_response(crop_response)
 
+    # Normalize safety
+    scheme = scheme_response if isinstance(scheme_response, dict) else None
+    crop = crop_response if isinstance(crop_response, dict) else None
 
-    # Ensure responses were generated
-    if intent == "scheme":
-        if scheme_response is None:
-            service_response = {"error": "Scheme service did not generate a response"}
-        else:
-            service_response = {"scheme": scheme_response}
-    elif intent == "crop":
-        if crop_response is None:
-            service_response = {"error": "Crop service did not generate a response"}
-        else:
-            service_response = {"crop": crop_response}
-    elif intent == "both":
-        # Combine both responses
-        combined = {}
-        if scheme_response is not None:
-            combined["scheme"] = scheme_response
-        else:
-            combined["scheme"] = {"error": "Scheme service did not generate a response"}
-        
-        if crop_response is not None:
-            combined["crop"] = crop_response
-        else:
-            combined["crop"] = {"error": "Crop service did not generate a response"}
-        
-        service_response = combined
-    else:
-        # For error cases or unknown intents
-        service_response = state.get("service_response", {"error": "Unknown intent or classification error"})
-    
-    return {**state, "service_response": service_response}
+    # Synthesize final answer
+    final_answer = synthesize_final_response(scheme, crop)
+
+    return {
+        **state,
+        "service_response": {
+            "response": final_answer
+        }
+    }
 
 # Routing function from supervisor
 def route_decision(state):
