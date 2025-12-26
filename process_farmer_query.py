@@ -46,12 +46,26 @@ class FarmerState(TypedDict):
     service_response: dict
 
 # Service URLs (from environment or defaults)
+
 SCHEME_SERVICE_URL = os.getenv(
-    "SCHEME_SERVICE_URL", "https://api.alumnx.com/api/agrigpt/query-government-schemes"
+    "SCHEME_SERVICE_URL",
+    "https://api.alumnx.com/api/agrigpt/query-government-schemes"
 )
-CROP_SERVICE_URL = os.getenv(
-    "CROP_SERVICE_URL", "https://api.alumnx.com/api/agrigpt/ask-with-image"
+
+# 🔽🔽🔽 CHANGE START: split crop services by modality 🔽🔽🔽
+
+CROP_TEXT_SERVICE_URL = os.getenv(
+    "CROP_TEXT_SERVICE_URL",
+    "https://api.alumnx.com/api/agrigpt/ask-consultant"
 )
+
+CROP_IMAGE_SERVICE_URL = os.getenv(
+    "CROP_IMAGE_SERVICE_URL",
+    "https://api.alumnx.com/api/agrigpt/ask-with-image"
+)
+
+# 🔼🔼🔼 CHANGE END 🔼🔼🔼
+
 
 # Initialize Gemini model for intent classification (only if key looked valid)
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
@@ -204,35 +218,51 @@ async def crop_node(state):
     query = state.get("text", "")
     image_url = state.get("imageUrl")
     print(f"in crop node. query: {query}, imageUrl: {image_url}")
-    
+
+    # 🔽🔽🔽 CHANGE START: decide modality 🔽🔽🔽
+    use_image = bool(image_url and image_url.startswith(("http://", "https://")))
+    # 🔼🔼🔼 CHANGE END 🔼🔼🔼
+
     try:
         async with httpx.AsyncClient() as client:
-            # Prepare multipart form data
-            data = {
-                "query": query,
-            }
-            
-            # Add mediaUrl if provided
-            if image_url:
-                data["mediaUrl"] = image_url
-            
-            # For now, we're not handling file upload (binary file)
-            # If you need to download and upload the image file, additional logic would be needed
-            
-            response = await client.post(
-                CROP_SERVICE_URL,
-                data=data,
-                timeout=30.0
-            )
+
+            # 🔽🔽🔽 CHANGE START: route to correct endpoint 🔽🔽🔽
+            if use_image:
+                url = CROP_IMAGE_SERVICE_URL
+                payload = {
+                    "query": query,
+                    "mediaUrl": image_url
+                }
+                # ask-with-image expects form-style or JSON depending on backend
+                response = await client.post(
+                    url,
+                    json=payload,  # switched to JSON for consistency
+                    timeout=30.0
+                )
+            else:
+                url = CROP_TEXT_SERVICE_URL
+                payload = {
+                    "query": query
+                }
+                # ask-consultant is TEXT ONLY
+                response = await client.post(
+                    url,
+                    json=payload,
+                    timeout=30.0
+                )
+            # 🔼🔼🔼 CHANGE END 🔼🔼🔼
+
             response.raise_for_status()
             crop_response = response.json()
+
     except Exception as e:
         import traceback
         print(f"[Crop Node] Error calling crop service: {e}")
         traceback.print_exc()
         crop_response = {"error": str(e)}
-    
+
     return {**state, "crop_response": crop_response}
+
 
 
 def error_node(state):
