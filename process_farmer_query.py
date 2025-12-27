@@ -1,40 +1,68 @@
+"""
+Farm Manager Service
+--------------------
+Agentic workflow using LangGraph to route farmer queries to:
+- Scheme service (government schemes)
+- Crop service (text or image based)
+- Collector (LLM synthesis into one final answer)
+
+This file is intentionally defensive:
+- Handles unstable backend schemas
+- Handles transient network failures
+- Avoids hallucinations and cross-domain leakage
+"""
+
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Literal
-import httpx
 import os
+import asyncio
+import httpx
 import google.generativeai as genai
-
 from dotenv import load_dotenv
+
+# -------------------------------------------------------------------
+# Environment & Gemini Setup
+# -------------------------------------------------------------------
 
 load_dotenv()
 
-# Configure Google Gemini client
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+
 
 def _validate_gemini_api_key() -> bool:
     """
-    Best-effort validation that the Gemini API key is configured.
-
-    IMPORTANT: Even if validation fails, the service should continue working
-    using a rule-based fallback so that farmer queries are still answered.
+    Best-effort Gemini validation.
+    If this fails, the system must still function via rule-based fallback.
     """
     if not GEMINI_API_KEY:
-        print("[Gemini] GEMINI_API_KEY is not set in the environment – Gemini features will be disabled, using rule-based fallback.")
+        print("[Gemini] API key missing – falling back to rule-based routing.")
         return False
 
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        # Optional lightweight sanity check. If it fails, we log and fall back.
-        test_model = genai.GenerativeModel(os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash"))
-        _ = test_model  # avoid 'unused' warnings
-        print("[Gemini] GEMINI_API_KEY configured. Gemini intent classification enabled.")
+        genai.GenerativeModel(GEMINI_MODEL_NAME)
+        print("[Gemini] Gemini intent + collector enabled.")
         return True
     except Exception as e:
-        # Most failures here are due to invalid / unauthorized API keys or networking issues
-        print(f"[Gemini] API key validation failed ({e!r}) – disabling Gemini and using rule-based fallback.")
+        print(f"[Gemini] Validation failed: {e!r}")
         return False
 
+
 GEMINI_API_KEY_VALID = _validate_gemini_api_key()
+
+gemini_model = (
+    genai.GenerativeModel(GEMINI_MODEL_NAME)
+    if GEMINI_API_KEY_VALID
+    else None
+)
+
+COLLECTOR_MODEL = gemini_model  # same model reused for synthesis
+
+
+# -------------------------------------------------------------------
+# State Definition
+# -------------------------------------------------------------------
 
 class FarmerState(TypedDict):
     text: str
@@ -45,35 +73,44 @@ class FarmerState(TypedDict):
     crop_response: dict | None
     service_response: dict
 
-# Service URLs (from environment or defaults)
+
+# -------------------------------------------------------------------
+# Service URLs
+# -------------------------------------------------------------------
+
 SCHEME_SERVICE_URL = os.getenv(
-    "SCHEME_SERVICE_URL", "https://api.alumnx.com/api/agrigpt/query-government-schemes"
-)
-CROP_SERVICE_URL = os.getenv(
-    "CROP_SERVICE_URL", "https://api.alumnx.com/api/agrigpt/ask-with-image"
+    "SCHEME_SERVICE_URL",
+    "https://api.alumnx.com/api/agrigpt/query-government-schemes"
 )
 
-# Initialize Gemini model for intent classification (only if key looked valid)
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
-gemini_model = (
-    genai.GenerativeModel(GEMINI_MODEL_NAME) if GEMINI_API_KEY_VALID else None
+CROP_TEXT_SERVICE_URL = os.getenv(
+    "CROP_TEXT_SERVICE_URL",
+    "https://api.alumnx.com/api/agrigpt/ask-consultant"
 )
+
+CROP_IMAGE_SERVICE_URL = os.getenv(
+    "CROP_IMAGE_SERVICE_URL",
+    "https://api.alumnx.com/api/agrigpt/ask-with-image"
+)
+
+# -------------------------------------------------------------------
+# Intent Classification (Fallback)
+# -------------------------------------------------------------------
 
 def _rule_based_intent(query: str) -> Literal["scheme", "crop", "both", "none"] | None:
     """
-    Simple keyword-based classifier used when Gemini is unavailable.
-    This prevents noisy configuration errors and still routes queries reasonably.
+    Used only when Gemini is unavailable.
     """
     q = query.lower()
 
     scheme_keywords = [
-        "scheme", "subsidy", "government", "yojana", "pm-kisan", "pm kisan",
-        "financial assistance", "grant", "loan", "benefit", "msme"
+        "scheme", "subsidy", "government", "yojana", "pm-kisan",
+        "financial assistance", "grant", "loan"
     ]
+
     crop_keywords = [
-        "crop", "disease", "pest", "yield", "harvest", "cultivation",
-        "sowing", "planting", "fertilizer", "fertiliser", "irrigation",
-        "season", "soil", "variety"
+        "crop", "disease", "pest", "yield", "fertilizer",
+        "soil", "irrigation", "plant", "tree"
     ]
 
     has_scheme = any(k in q for k in scheme_keywords)
@@ -88,209 +125,319 @@ def _rule_based_intent(query: str) -> Literal["scheme", "crop", "both", "none"] 
 
     return None
 
+
+# -------------------------------------------------------------------
+# Supervisor Node
+# -------------------------------------------------------------------
+
 def supervisor_node(state):
-    query = state.get("text", "").strip()
+    """
+    Decides intent: scheme / crop / both.
+    Uses Gemini if available, otherwise rule-based.
+    """
+    query = (state.get("text") or "").strip()
     image_url = state.get("imageUrl")
-    print(f"[Supervisor] In supervisor node. Query: {query!r}, ImageUrl: {image_url!r}")
-    
-    # Handle case where there's only an image but no text
+
+    print(f"[Supervisor] query={query!r}, imageUrl={image_url!r}")
+
+    # Image without text → crop by default
     if not query and image_url:
-        print("[Supervisor] Image provided without text – defaulting to 'crop' intent (images typically used for crop disease/pest identification).")
         return {**state, "intent": "crop", "entities": {}}
-    
-    # Handle empty/null queries with no image
+
     if not query:
-        print("[Supervisor] Empty query received and no image – skipping classification.")
         return {**state, "intent": None, "entities": {}}
-    
-    # If Gemini is not available, use rule-based classifier and avoid noisy config errors
-    if not GEMINI_API_KEY or not GEMINI_API_KEY_VALID or gemini_model is None:
+
+    if not gemini_model:
         intent = _rule_based_intent(query)
-        print(f"[Supervisor] Using rule-based intent classification. Intent: {intent!r}")
+        print(f"[Supervisor] Rule-based intent={intent}")
         return {**state, "intent": intent, "entities": {}}
 
-    # LLM classifies intent (only when Gemini is healthy)
-    # If there's an image, include it in the classification
-    prompt_parts = []
-    
-    # Add image if available
-    if image_url:
-        try:
-            import base64
-            import mimetypes
-            
-            # Download the image
-            with httpx.Client() as client:
-                img_response = client.get(image_url, timeout=10.0)
-                img_response.raise_for_status()
-                image_data = img_response.content
-            
-            # Determine MIME type
-            mime_type, _ = mimetypes.guess_type(image_url)
-            if not mime_type:
-                mime_type = "image/jpeg"  # Default fallback
-            
-            # Add image to prompt
-            prompt_parts.append({
-                "mime_type": mime_type,
-                "data": base64.b64encode(image_data).decode()
-            })
-            print(f"[Supervisor] Image loaded for classification: {mime_type}")
-        except Exception as e:
-            print(f"[Supervisor] Warning: Could not load image for classification: {e}. Proceeding with text-only classification.")
-    
-    # Add text prompt
-    text_prompt = f"""Classify the following farmer query into one of these intents: "scheme", "crop", "both" or "none".
+    prompt = f"""
+Classify the farmer query into one of:
+scheme | crop | both | none
 
-Query: {query}
+Query:
+{query}
 
-Rules:
-- "scheme": Questions about government schemes, subsidies, financial assistance, programs in India.
-- "crop": Questions about crop cultivation, seasons, growing conditions, crop-specific advice, crop diseases etc.
-- "both": Queries that require information from both scheme and crop categories.
-- "none": Queries that don't fit scheme or crop categories.
-
-Examples:
-1. Query : "What are the government schemes in Andhra Pradesh?" , intent : "scheme",
-2. Query : "What is Citrus Canker?", intent : "crop",
-3. Query : "Tell me what government schemes help me to address citrus canker?", intent : "both"
-Respond with ONLY one word: scheme, crop, both, or none."""
-    
-    prompt_parts.append(text_prompt)
+Respond with ONLY one word.
+"""
 
     try:
-        response = gemini_model.generate_content(prompt_parts)
-        raw_text = (response.text or "")
-        print(f"[Supervisor] Raw Gemini response: {raw_text!r}")
-        intent = raw_text.strip().lower()
-        
-        # Validate intent
-        if intent not in ["scheme", "crop", "both", "none"]:
-            print(f"[Supervisor] Unexpected intent value from Gemini: {intent!r}")
+        response = gemini_model.generate_content(prompt)
+        intent = (response.text or "").strip().lower()
+        if intent not in {"scheme", "crop", "both"}:
             intent = None
-        elif intent == "none":
-            print("[Supervisor] Gemini classified intent as 'none'.")
-            intent = None
-        else:
-            print(f"[Supervisor] Classified intent: {intent!r}")
-
         return {**state, "intent": intent, "entities": {}}
     except Exception:
-        # Other errors - log and return None intent
-        import traceback
-        print("[Supervisor] Unexpected error during intent classification:")
-        traceback.print_exc()
-        return {**state, "intent": None, "entities": {}, "service_response": {"error": "Gemini classification failed"}}
+        return {**state, "intent": None, "entities": {}}
+
+
+# -------------------------------------------------------------------
+# Scheme Node
+# -------------------------------------------------------------------
 
 async def scheme_node(state):
+    """
+    Fetches Andhra Pradesh government schemes.
+    """
     query = state.get("text", "")
-    print(f"in scheme node. query: {query}")
-    
+    print(f"[Scheme Node] query={query}")
+
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(
+            r = await client.post(
                 SCHEME_SERVICE_URL,
-                json={"query": query},
+                json={
+                    "query": f"""
+You are an expert on ANDHRA PRADESH agricultural government schemes.
+
+Rules:
+- Andhra Pradesh only
+- Mention applicability per crop if relevant
+- Do NOT hallucinate
+
+Farmer question:
+{query}
+"""
+                },
                 timeout=30.0
             )
-            response.raise_for_status()
-            scheme_response = response.json()
+            r.raise_for_status()
+            return {**state, "scheme_response": r.json()}
     except Exception as e:
-        scheme_response = {"error": str(e)}
-    
-    return {**state, "scheme_response": scheme_response}
+        return {**state, "scheme_response": {"error": str(e)}}
+
+
+# -------------------------------------------------------------------
+# Crop Utilities
+# -------------------------------------------------------------------
+
+def normalize_crop_output(raw: dict) -> dict:
+    """
+    Backend may return:
+    - { "answer": ... }
+    - { "response": ... }
+    Normalize to { "response": ... }
+    """
+    if not isinstance(raw, dict):
+        return {"response": str(raw)}
+
+    if "response" in raw:
+        return raw
+
+    if "answer" in raw:
+        raw["response"] = raw.pop("answer")
+        return raw
+
+    return {"response": str(raw)}
+
+
+async def post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    data: dict | None = None,
+    json: dict | None = None,
+    retries: int = 3,
+):
+    """
+    Retries transient network failures (Windows + TLS common issue).
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            return await client.post(
+                url,
+                data=data,
+                json=json,
+                timeout=httpx.Timeout(30.0, connect=10.0),
+            )
+        except httpx.ConnectError:
+            if attempt == retries:
+                raise
+            await asyncio.sleep(1.5 * attempt)
+
+
+# -------------------------------------------------------------------
+# Crop Node
+# -------------------------------------------------------------------
 
 async def crop_node(state):
-    query = state.get("text", "")
+    """
+    Handles crop advisory:
+    - Image → ask-with-image (multipart/form-data)
+    - Text → ask-consultant (JSON)
+    """
+    query = (state.get("text") or "").strip()
     image_url = state.get("imageUrl")
-    print(f"in crop node. query: {query}, imageUrl: {image_url}")
-    
+
+    print(f"[Crop Node] query={query!r}, imageUrl={image_url!r}")
+
+    use_image = bool(image_url and image_url.startswith(("http://", "https://")))
+
+    if use_image and not query:
+        query = (
+            "Analyze the crop shown in the image and identify possible diseases, "
+            "nutrient deficiencies, or pest issues."
+        )
+
     try:
-        async with httpx.AsyncClient() as client:
-            # Prepare multipart form data
-            data = {
-                "query": query,
+        async with httpx.AsyncClient(
+            headers={
+                "User-Agent": "farm-manager-service/1.0",
+                "Accept": "application/json",
             }
-            
-            # Add mediaUrl if provided
-            if image_url:
-                data["mediaUrl"] = image_url
-            
-            # For now, we're not handling file upload (binary file)
-            # If you need to download and upload the image file, additional logic would be needed
-            
-            response = await client.post(
-                CROP_SERVICE_URL,
-                data=data,
-                timeout=30.0
-            )
-            response.raise_for_status()
-            crop_response = response.json()
+        ) as client:
+
+            if use_image:
+                r = await post_with_retry(
+                    client,
+                    CROP_IMAGE_SERVICE_URL,
+                    data={"query": query, "mediaUrl": image_url},
+                )
+            else:
+                r = await post_with_retry(
+                    client,
+                    CROP_TEXT_SERVICE_URL,
+                    json={
+                        "query": f"""
+You are an agricultural crop advisor.
+
+Rules:
+- Any crop
+- No government schemes
+- Give practical advice only
+
+Farmer query:
+{query}
+"""
+                    },
+                )
+
+            r.raise_for_status()
+            crop_response = normalize_crop_output(r.json())
+
+    except httpx.ConnectError:
+        crop_response = {
+            "error": "Crop service temporarily unreachable. Please try again."
+        }
     except Exception as e:
-        import traceback
-        print(f"[Crop Node] Error calling crop service: {e}")
-        traceback.print_exc()
         crop_response = {"error": str(e)}
-    
+
     return {**state, "crop_response": crop_response}
 
+
+# -------------------------------------------------------------------
+# Collector (LLM Synthesis)
+# -------------------------------------------------------------------
+
+def synthesize_final_response(
+    intent: Literal["scheme", "crop", "both"] | None,
+    scheme: dict | None,
+    crop: dict | None,
+) -> str:
+    """
+    Produces the final farmer-facing response based on intent.
+    - scheme  → scheme only
+    - crop    → crop only
+    - both    → intelligently combine
+    """
+
+    scheme_text = scheme.get("response") if isinstance(scheme, dict) else None
+    crop_text = crop.get("response") if isinstance(crop, dict) else None
+
+    # -------------------------
+    # Intent-driven shortcuts
+    # -------------------------
+    if intent == "crop":
+        return crop_text or "No crop advisory information available."
+
+    if intent == "scheme":
+        return scheme_text or "No government scheme information available."
+
+    # intent == "both" or unknown → combine
+    if not COLLECTOR_MODEL:
+        return (
+            "\n\n".join(filter(None, [crop_text, scheme_text]))
+            or "No information available."
+        )
+
+    # -------------------------
+    # LLM synthesis for BOTH
+    # -------------------------
+    prompt = f"""
+You are an agricultural assistant responding to a farmer.
+
+Combine the following information into ONE clear, helpful response.
+
+Rules:
+- Do NOT repeat information.
+- Clearly separate crop advice vs government support.
+- If one section is missing, answer with what is available.
+- Use simple, farmer-friendly language.
+
+Crop Advisory:
+{crop_text or "N/A"}
+
+Government Schemes:
+{scheme_text or "N/A"}
+
+Final Answer:
+"""
+
+    try:
+        r = COLLECTOR_MODEL.generate_content(prompt)
+        return (r.text or "").strip()
+    except Exception:
+        return (
+            "\n\n".join(filter(None, [crop_text, scheme_text]))
+            or "No information available."
+        )
+
+def collector_node(state):
+    """
+    Final aggregation node.
+    Delegates decision-making to synthesize_final_response based on intent.
+    """
+    intent = state.get("intent")
+
+    final_answer = synthesize_final_response(
+        intent=intent,
+        scheme=state.get("scheme_response"),
+        crop=state.get("crop_response"),
+    )
+
+    return {
+        **state,
+        "service_response": {
+            "response": final_answer
+        }
+    }
+
+
+# -------------------------------------------------------------------
+# Error Node
+# -------------------------------------------------------------------
 
 def error_node(state):
     return {**state, "service_response": {"error": "cannot classify"}}
 
-def collector_node(state):
-    """Collect and combine responses from scheme and/or crop nodes"""
-    print("in collector node")
-    intent = state.get("intent")
-    scheme_response = state.get("scheme_response")
-    crop_response = state.get("crop_response")
-    
-    # Ensure responses were generated
-    if intent == "scheme":
-        if scheme_response is None:
-            service_response = {"error": "Scheme service did not generate a response"}
-        else:
-            service_response = {"scheme": scheme_response}
-    elif intent == "crop":
-        if crop_response is None:
-            service_response = {"error": "Crop service did not generate a response"}
-        else:
-            service_response = {"crop": crop_response}
-    elif intent == "both":
-        # Combine both responses
-        combined = {}
-        if scheme_response is not None:
-            combined["scheme"] = scheme_response
-        else:
-            combined["scheme"] = {"error": "Scheme service did not generate a response"}
-        
-        if crop_response is not None:
-            combined["crop"] = crop_response
-        else:
-            combined["crop"] = {"error": "Crop service did not generate a response"}
-        
-        service_response = combined
-    else:
-        # For error cases or unknown intents
-        service_response = state.get("service_response", {"error": "Unknown intent or classification error"})
-    
-    return {**state, "service_response": service_response}
 
-# Routing function from supervisor
+# -------------------------------------------------------------------
+# Routing
+# -------------------------------------------------------------------
+
 def route_decision(state):
-    intent = state.get("intent")
-    if intent is None:
-        return "none"
-    return intent
+    return state.get("intent") or "none"
 
-# Routing function from scheme_node - if intent is "both", go to crop_node, else go to collector
+
 def route_from_scheme(state):
-    intent = state.get("intent")
-    if intent == "both":
-        return "crop_node"
-    return "collector"
+    return "crop_node" if state.get("intent") == "both" else "collector"
 
-# Build graph
+
+# -------------------------------------------------------------------
+# Graph Construction
+# -------------------------------------------------------------------
+
 workflow = StateGraph(FarmerState)
 
 workflow.add_node("supervisor", supervisor_node)
@@ -301,32 +448,27 @@ workflow.add_node("error_node", error_node)
 
 workflow.set_entry_point("supervisor")
 
-# Supervisor routes based on intent classification
 workflow.add_conditional_edges(
     "supervisor",
     route_decision,
     {
         "scheme": "scheme_node",
         "crop": "crop_node",
-        "both": "scheme_node",  # Route to scheme_node first, then it will route to crop_node
-        "none": "error_node"
-    }
+        "both": "scheme_node",
+        "none": "error_node",
+    },
 )
 
-# scheme_node routes: if intent is "both", go to crop_node, else go to collector
 workflow.add_conditional_edges(
     "scheme_node",
     route_from_scheme,
     {
         "crop_node": "crop_node",
-        "collector": "collector"
-    }
+        "collector": "collector",
+    },
 )
 
-# crop_node always routes to collector
 workflow.add_edge("crop_node", "collector")
-
-# Collector and error node are terminal
 workflow.add_edge("collector", END)
 workflow.add_edge("error_node", END)
 
